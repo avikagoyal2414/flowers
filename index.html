@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terminal Bouquet</title>
+<style>
+/* Layout: one centered black stage, character-art canvas on top, a small terminal caption and a Replay button below. Single dark look by choice. */
+html, body { margin: 0; }
+:root {
+  --bg: #050407;
+  --fg: #ece5ea;
+  --dim: #8d838b;
+  --accent: #ff6b97;
+  --line: #2c2631;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  color-scheme: dark;
+}
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.5 var(--mono);
+  padding-block: 20px 28px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap {
+  max-width: 640px;
+  margin-inline: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+canvas { display: block; max-width: 100%; background: var(--bg); }
+.cap { margin: 8px 0 0; color: var(--dim); }
+.cap .prompt { color: var(--accent); }
+.status { margin: 0; color: var(--fg); min-height: 1.5em; }
+.status.done { color: var(--accent); }
+button {
+  align-self: flex-start;
+  margin-top: 6px;
+  font: inherit;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+button:hover { border-color: var(--accent); color: var(--accent); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+
+<main class="wrap">
+  <canvas id="view" role="img" aria-label="Animated bouquet of roses and lilies drawn with colored text characters on a black background"></canvas>
+  <p class="cap"><span class="prompt">$</span> grow bouquet --roses --lilies</p>
+  <p class="status" id="status">blooming 0 of 12</p>
+  <button id="replay" type="button">Replay</button>
+</main>
+
+<script>
+(function () {
+  var W = 720, H = 960, SW = 360, SH = 480;
+  var COLS = 150, CELL_ASPECT = 1.9;
+  var ROWS = Math.round(COLS * (H / W) / CELL_ASPECT);
+  var BG = '#050407';
+  var MONO = 'ui-monospace, Menlo, Consolas, "Courier New", monospace';
+  var DUR = 7.8;
+
+  var scene = document.createElement('canvas');
+  scene.width = SW; scene.height = SH;
+  var sctx = scene.getContext('2d', { willReadFrequently: true });
+  var view = document.getElementById('view');
+  var vctx = view.getContext('2d');
+  var statusEl = document.getElementById('status');
+
+  /* ---------- helpers ---------- */
+  function clamp01(t) { return t < 0 ? 0 : t > 1 ? 1 : t; }
+  function easeOut(t) { t = clamp01(t); return 1 - Math.pow(1 - t, 3); }
+  function backOut(t) { t = clamp01(t); var c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); }
+  function mulberry(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function bez(a, b, c, s) {
+    var u = 1 - s;
+    return [u * u * a[0] + 2 * u * s * b[0] + s * s * c[0], u * u * a[1] + 2 * u * s * b[1] + s * s * c[1]];
+  }
+
+  /* ---------- palettes ---------- */
+  var LILY = {
+    red:      { throat: '#e9c24d', base: '#8d1020', mid: '#d42434', tip: '#f4685a', spot: 'rgba(60,0,10,.6)' },
+    magenta:  { throat: '#f3d77a', base: '#7b2a86', mid: '#c657b8', tip: '#e79ad8', spot: 'rgba(60,0,70,.55)' },
+    yellow:   { throat: '#e8892a', base: '#e8b81c', mid: '#f6d23a', tip: '#fff08a', spot: 'rgba(150,70,0,.55)' },
+    cream:    { throat: '#e7c860', base: '#d9b79a', mid: '#f1d9c2', tip: '#fff1e2', spot: 'rgba(140,60,40,.5)' },
+    pinkcream:{ throat: '#e7c860', base: '#d79ab0', mid: '#f0cbd4', tip: '#fff0f2', spot: 'rgba(150,40,80,.5)' }
+  };
+  var ROSE = {
+    red:   { dark: '#5c0a18', mid: '#c8203a', light: '#f0586a' },
+    pink:  { dark: '#9a2552', mid: '#e8579b', light: '#ffa9cf' },
+    yellow:{ dark: '#b8801a', mid: '#f2c53a', light: '#fff08c' },
+    peach: { dark: '#b8654a', mid: '#f0a587', light: '#ffd9c2' }
+  };
+
+  /* ---------- flowers, back to front ---------- */
+  var flowers = [
+    { k: 'l', x: 240, y: 170, s: 115, rot: 15, pal: LILY.cream, seed: 11 },
+    { k: 'l', x: 480, y: 150, s: 112, rot: 40, pal: LILY.yellow, seed: 12 },
+    { k: 'l', x: 140, y: 340, s: 108, rot: 0, pal: LILY.yellow, seed: 13 },
+    { k: 'l', x: 600, y: 285, s: 105, rot: 20, pal: LILY.yellow, seed: 14 },
+    { k: 'l', x: 370, y: 300, s: 160, rot: 10, pal: LILY.red, seed: 15 },
+    { k: 'r', x: 250, y: 400, s: 78, rot: 0.3, pal: ROSE.pink, seed: 21 },
+    { k: 'r', x: 600, y: 440, s: 68, rot: 1.1, pal: ROSE.yellow, seed: 22 },
+    { k: 'l', x: 170, y: 500, s: 135, rot: 25, pal: LILY.magenta, seed: 16 },
+    { k: 'r', x: 520, y: 470, s: 82, rot: 0.7, pal: ROSE.red, seed: 23 },
+    { k: 'l', x: 430, y: 570, s: 138, rot: 0, pal: LILY.pinkcream, seed: 17 },
+    { k: 'r', x: 290, y: 610, s: 72, rot: 0.5, pal: ROSE.peach, seed: 24 },
+    { k: 'r', x: 590, y: 600, s: 70, rot: 1.6, pal: ROSE.red, seed: 25 }
+  ];
+  var FLOWER_STEP = 0.4;
+
+  var leaves = [
+    { x: 352, y: 880, a: -2.75, len: 260, w: 20 },
+    { x: 368, y: 880, a: -0.4, len: 260, w: 20 },
+    { x: 350, y: 860, a: -2.35, len: 230, w: 24 },
+    { x: 370, y: 860, a: -0.8, len: 230, w: 24 },
+    { x: 358, y: 850, a: -1.95, len: 250, w: 18 },
+    { x: 362, y: 850, a: -1.2, len: 250, w: 18 },
+    { x: 345, y: 800, a: -2.9, len: 170, w: 34 },
+    { x: 375, y: 800, a: -0.25, len: 170, w: 34 },
+    { x: 340, y: 760, a: -2.5, len: 150, w: 34 },
+    { x: 380, y: 760, a: -0.65, len: 150, w: 34 }
+  ];
+
+  /* ---------- drawing: leaf, stem, lily, rose, bow ---------- */
+  function drawLeaf(c, l, g) {
+    if (g <= 0.01) return;
+    var L = l.len * g, Wd = l.w * g;
+    c.save(); c.translate(l.x, l.y); c.rotate(l.a);
+    c.beginPath(); c.moveTo(0, 0);
+    c.bezierCurveTo(L * 0.25, -Wd, L * 0.7, -Wd * 0.85, L, 0);
+    c.bezierCurveTo(L * 0.7, Wd * 0.85, L * 0.25, Wd, 0, 0);
+    var gr = c.createLinearGradient(0, 0, L, 0);
+    gr.addColorStop(0, '#1f6a2c'); gr.addColorStop(0.5, '#3fa04a'); gr.addColorStop(1, '#8fd36a');
+    c.fillStyle = gr; c.fill();
+    c.strokeStyle = 'rgba(0,0,0,.3)'; c.lineWidth = 1.6; c.stroke();
+    c.strokeStyle = 'rgba(220,255,200,.45)'; c.lineWidth = 1.6;
+    c.beginPath(); c.moveTo(L * 0.04, 0); c.lineTo(L * 0.95, 0); c.stroke();
+    c.restore();
+  }
+
+  function drawStem(c, P0, P1, P2, p, width) {
+    if (p <= 0.01) return;
+    var steps = Math.max(2, Math.floor(40 * p));
+    function path() {
+      c.beginPath();
+      for (var i = 0; i <= steps; i++) {
+        var pt = bez(P0, P1, P2, p * i / steps);
+        if (i) c.lineTo(pt[0], pt[1]); else c.moveTo(pt[0], pt[1]);
+      }
+    }
+    c.lineCap = 'round'; c.lineJoin = 'round';
+    path(); c.strokeStyle = '#2b8a38'; c.lineWidth = width; c.stroke();
+    c.save(); c.translate(-1.2, 0);
+    path(); c.strokeStyle = '#8be07a'; c.lineWidth = width * 0.3; c.stroke();
+    c.restore();
+  }
+
+  function drawLily(c, f, o) {
+    if (o <= 0.01) return;
+    var pal = f.pal, rnd = mulberry(f.seed);
+    var L = f.s * o, open = 1 - o, rotR = f.rot * Math.PI / 180;
+    c.save(); c.translate(f.x, f.y);
+    var order = [0, 2, 4, 1, 3, 5];
+    for (var q = 0; q < 6; q++) {
+      var k = order[q], inner = k % 2 === 1;
+      var a = rotR + k * Math.PI / 3 + open * 0.6 + (rnd() - 0.5) * 0.08;
+      var len = L * (inner ? 0.93 : 1), w = L * (inner ? 0.30 : 0.24);
+      c.save(); c.rotate(a);
+      c.beginPath(); c.moveTo(0, 0);
+      c.bezierCurveTo(len * 0.2, -w * 0.7, len * 0.58, -w * 1.25, len, 0);
+      c.bezierCurveTo(len * 0.58, w * 1.25, len * 0.2, w * 0.7, 0, 0);
+      var g = c.createLinearGradient(0, 0, len, 0);
+      g.addColorStop(0, pal.throat); g.addColorStop(0.16, pal.base);
+      g.addColorStop(0.55, pal.mid); g.addColorStop(1, pal.tip);
+      c.fillStyle = g; c.fill();
+      c.lineWidth = 2; c.strokeStyle = 'rgba(0,0,0,.35)'; c.stroke();
+      c.lineWidth = 1.6; c.strokeStyle = 'rgba(0,0,0,.3)';
+      c.beginPath(); c.moveTo(len * 0.06, 0); c.lineTo(len * 0.92, 0); c.stroke();
+      c.strokeStyle = 'rgba(255,255,255,.22)';
+      for (var v = -2; v <= 2; v++) {
+        if (!v) continue;
+        c.beginPath(); c.moveTo(len * 0.1, 0);
+        c.quadraticCurveTo(len * 0.5, v * w * 0.45, len * 0.88, v * w * 0.12); c.stroke();
+      }
+      c.fillStyle = pal.spot;
+      for (var s = 0; s < 9; s++) {
+        var px = len * (0.1 + rnd() * 0.4), py = (rnd() - 0.5) * w * 0.8;
+        c.beginPath(); c.arc(px, py, 1.8 + rnd() * 1.6, 0, 6.283); c.fill();
+      }
+      c.restore();
+    }
+    for (var m = 0; m < 6; m++) {
+      var sa = rotR + m * Math.PI / 3 + Math.PI / 6 + open * 0.6;
+      var sl = L * (0.46 + rnd() * 0.08);
+      var ex = Math.cos(sa) * sl, ey = Math.sin(sa) * sl;
+      c.strokeStyle = '#cfe08a'; c.lineWidth = 2.2; c.beginPath(); c.moveTo(0, 0);
+      c.quadraticCurveTo(Math.cos(sa) * sl * 0.5 + Math.sin(sa) * 6, Math.sin(sa) * sl * 0.5 - Math.cos(sa) * 6, ex, ey);
+      c.stroke();
+      c.save(); c.translate(ex, ey); c.rotate(sa + (rnd() - 0.5) * 0.6);
+      c.fillStyle = '#8a3d10'; c.beginPath(); c.ellipse(0, 0, 9, 3.6, 0, 0, 6.283); c.fill();
+      c.fillStyle = '#e58a2e'; c.beginPath(); c.ellipse(-1, -0.8, 6, 1.8, 0, 0, 6.283); c.fill();
+      c.restore();
+    }
+    var pa = rotR + 0.3 + open * 0.6, pl = L * 0.6;
+    c.strokeStyle = '#b6d76a'; c.lineWidth = 3;
+    c.beginPath(); c.moveTo(0, 0); c.lineTo(Math.cos(pa) * pl, Math.sin(pa) * pl); c.stroke();
+    c.fillStyle = '#e9d84a'; c.beginPath(); c.arc(Math.cos(pa) * pl, Math.sin(pa) * pl, 4.5, 0, 6.283); c.fill();
+    c.restore();
+  }
+
+  var ROSE_LAYERS = [
+    { n: 6, d: 0.50, pr: 0.55 }, { n: 5, d: 0.42, pr: 0.50 },
+    { n: 5, d: 0.34, pr: 0.44 }, { n: 4, d: 0.25, pr: 0.36 }, { n: 3, d: 0.14, pr: 0.26 }
+  ];
+  function drawRose(c, f, o) {
+    if (o <= 0.01) return;
+    var pal = f.pal, rnd = mulberry(f.seed), R = f.s * o;
+    c.save(); c.translate(f.x, f.y); c.rotate(f.rot + (1 - o) * 1.4);
+    var g = c.createRadialGradient(0, 0, R * 0.1, 0, 0, R * 1.15);
+    g.addColorStop(0, pal.mid); g.addColorStop(1, pal.dark);
+    c.fillStyle = g; c.beginPath(); c.arc(0, 0, R * 1.05, 0, 6.283); c.fill();
+    for (var i = 0; i < ROSE_LAYERS.length; i++) {
+      var ly = ROSE_LAYERS[i], off = i * 0.7 + rnd() * 0.3;
+      for (var k = 0; k < ly.n; k++) {
+        var a = off + k * (6.283 / ly.n);
+        var cx = Math.cos(a) * R * ly.d, cy = Math.sin(a) * R * ly.d, rad = R * ly.pr;
+        var pg = c.createRadialGradient(cx + Math.cos(a) * rad * 0.35, cy + Math.sin(a) * rad * 0.35, rad * 0.05, cx, cy, rad);
+        pg.addColorStop(0, pal.light); pg.addColorStop(0.6, pal.mid); pg.addColorStop(1, pal.dark);
+        c.fillStyle = pg; c.beginPath(); c.arc(cx, cy, rad, 0, 6.283); c.fill();
+        c.strokeStyle = 'rgba(0,0,0,.4)'; c.lineWidth = 1.8; c.stroke();
+      }
+    }
+    c.strokeStyle = 'rgba(0,0,0,.5)'; c.lineWidth = 1.6; c.beginPath();
+    for (var t = 0; t <= 4 * Math.PI; t += 0.15) {
+      var rr = R * 0.04 * t, px = Math.cos(t) * rr, py = Math.sin(t) * rr;
+      if (t === 0) c.moveTo(px, py); else c.lineTo(px, py);
+    }
+    c.stroke();
+    c.restore();
+  }
+
+  function drawBow(c, x, y, o) {
+    if (o <= 0.01) return;
+    c.save(); c.translate(x, y); c.scale(o, o);
+    var g = c.createLinearGradient(-90, -40, 90, 110);
+    g.addColorStop(0, '#ff9dbd'); g.addColorStop(1, '#e23a7a');
+    c.fillStyle = g; c.strokeStyle = 'rgba(0,0,0,.3)'; c.lineWidth = 2;
+    c.beginPath(); c.moveTo(-6, 8); c.quadraticCurveTo(-40, 50, -56, 112); c.lineTo(-30, 98); c.lineTo(-12, 118); c.quadraticCurveTo(-6, 60, 4, 12); c.closePath(); c.fill(); c.stroke();
+    c.beginPath(); c.moveTo(6, 8); c.quadraticCurveTo(40, 50, 56, 112); c.lineTo(30, 98); c.lineTo(12, 118); c.quadraticCurveTo(6, 60, -4, 12); c.closePath(); c.fill(); c.stroke();
+    c.save(); c.translate(-48, -6); c.rotate(-0.35); c.beginPath(); c.ellipse(0, 0, 54, 28, 0, 0, 6.283); c.fill(); c.stroke(); c.restore();
+    c.save(); c.translate(48, -6); c.rotate(0.35); c.beginPath(); c.ellipse(0, 0, 54, 28, 0, 0, 6.283); c.fill(); c.stroke(); c.restore();
+    c.beginPath(); c.ellipse(0, 0, 17, 19, 0, 0, 6.283); c.fillStyle = '#ff7aa5'; c.fill(); c.stroke();
+    c.restore();
+  }
+
+  /* ---------- scene per frame ---------- */
+  var countDone = 0;
+  function drawScene(T) {
+    var c = sctx;
+    c.setTransform(SW / W, 0, 0, SH / H, 0, 0);
+    c.fillStyle = '#000'; c.fillRect(0, 0, W, H);
+    var i;
+    for (i = 0; i < leaves.length; i++) drawLeaf(c, leaves[i], easeOut((T - (0.2 + i * 0.15)) / 1.0));
+    var blooms = [];
+    for (i = 0; i < flowers.length; i++) {
+      var f = flowers[i], start = 0.5 + i * FLOWER_STEP;
+      var p = easeOut((T - start) / 1.1);
+      var P0 = [360 + ((i * 37) % 7 - 3) * 7, 955];
+      var P1 = [f.x + (360 - f.x) * 0.55, 760];
+      drawStem(c, P0, P1, [f.x, f.y], p, 6);
+      blooms.push(backOut((T - (start + 0.8)) / 0.9));
+    }
+    countDone = 0;
+    for (i = 0; i < flowers.length; i++) {
+      if (blooms[i] > 0.97) countDone++;
+      if (flowers[i].k === 'l') drawLily(c, flowers[i], blooms[i]);
+      else drawRose(c, flowers[i], blooms[i]);
+    }
+    drawBow(c, 360, 790, backOut((T - 6.7) / 0.7));
+  }
+
+  /* ---------- sample scene into text cells ---------- */
+  var N = COLS * ROWS;
+  var cR = new Uint8Array(N), cG = new Uint8Array(N), cB = new Uint8Array(N), cI = new Float32Array(N);
+  var xs = [], ys = [], jitter = new Int8Array(N);
+  (function () {
+    var rnd = mulberry(7), i;
+    for (i = 0; i <= COLS; i++) xs.push(Math.floor(i * SW / COLS));
+    for (i = 0; i <= ROWS; i++) ys.push(Math.floor(i * SH / ROWS));
+    for (i = 0; i < N; i++) jitter[i] = rnd() < 0.3 ? -1 : rnd() < 0.5 ? 1 : 0;
+  })();
+
+  function sample() {
+    var d = sctx.getImageData(0, 0, SW, SH).data;
+    for (var cy = 0; cy < ROWS; cy++) {
+      var y0 = ys[cy], y1 = Math.max(y0 + 1, ys[cy + 1]);
+      for (var cx = 0; cx < COLS; cx++) {
+        var x0 = xs[cx], x1 = Math.max(x0 + 1, xs[cx + 1]);
+        var r = 0, g = 0, b = 0, n = 0, t = 0;
+        for (var y = y0; y < y1; y++) {
+          var row = y * SW;
+          for (var x = x0; x < x1; x++) {
+            var i = (row + x) * 4, R = d[i], G = d[i + 1], B = d[i + 2];
+            t++;
+            if (R + G + B > 40) { r += R; g += G; b += B; n++; }
+          }
+        }
+        var idx = cy * COLS + cx;
+        if (!n) { cI[idx] = 0; continue; }
+        r /= n; g /= n; b /= n;
+        var cov = n / t, lum = (0.3 * r + 0.59 * g + 0.11 * b) / 255;
+        cR[idx] = Math.min(255, r * 1.15 + 10);
+        cG[idx] = Math.min(255, g * 1.15 + 10);
+        cB[idx] = Math.min(255, b * 1.15 + 10);
+        cI[idx] = Math.pow(cov, 0.6) * (0.35 + 0.65 * lum);
+      }
+    }
+  }
+
+  /* ---------- render text cells ---------- */
+  var RAMP = ['.', ':', '-', '=', '+', '*', 'x', 'o', 'O', '#', '%', '@'];
+  var colorCache = new Array(4096);
+  function colorOf(r, g, b) {
+    var key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+    return colorCache[key] || (colorCache[key] = 'rgb(' + ((r >> 4) * 17) + ',' + ((g >> 4) * 17) + ',' + ((b >> 4) * 17) + ')');
+  }
+
+  var cw = 4, ch = 8, vw = 600, vh = 800;
+  function resize() {
+    var avail = view.parentElement.clientWidth || 600;
+    var cssW = Math.min(avail, 640);
+    var dpr = Math.min(window.devicePixelRatio || 1, 3);
+    view.width = Math.round(cssW * dpr);
+    cw = view.width / COLS; ch = cw * CELL_ASPECT;
+    view.height = Math.round(ch * ROWS);
+    vw = view.width; vh = view.height;
+    view.style.width = cssW + 'px';
+    view.style.height = (vh / dpr) + 'px';
+    vctx.font = '600 100px ' + MONO;
+    var m = vctx.measureText('M').width || 60;
+    vctx.font = '600 ' + (100 * cw / m) + 'px ' + MONO;
+    vctx.textAlign = 'center'; vctx.textBaseline = 'middle';
+  }
+
+  function render() {
+    vctx.fillStyle = BG; vctx.fillRect(0, 0, vw, vh);
+    var last = RAMP.length - 1;
+    for (var cy = 0; cy < ROWS; cy++) {
+      var py = (cy + 0.5) * ch;
+      for (var cx = 0; cx < COLS; cx++) {
+        var idx = cy * COLS + cx, v = cI[idx];
+        if (v <= 0) continue;
+        var k = Math.floor(v * last) + jitter[idx];
+        if (k < 0) k = 0; else if (k > last) k = last;
+        vctx.fillStyle = colorOf(cR[idx], cG[idx], cB[idx]);
+        vctx.fillText(RAMP[k], (cx + 0.5) * cw, py);
+      }
+    }
+  }
+
+  /* ---------- loop ---------- */
+  var T = 0, lastTs = 0, raf = 0, shownCount = -1;
+  function setStatus(done) {
+    var txt = done ? 'done. this one is for you.' : 'blooming ' + countDone + ' of ' + flowers.length;
+    if (txt !== shownCount) { statusEl.textContent = txt; shownCount = txt; }
+    statusEl.className = done ? 'status done' : 'status';
+  }
+  function step(ts) {
+    if (!lastTs) lastTs = ts;
+    T += Math.min((ts - lastTs) / 1000, 0.1);
+    lastTs = ts;
+    var finished = T >= DUR;
+    if (finished) T = DUR;
+    drawScene(T); sample(); render();
+    setStatus(finished);
+    raf = finished ? 0 : requestAnimationFrame(step);
+  }
+  function start() {
+    if (raf) cancelAnimationFrame(raf);
+    T = 0; lastTs = 0; shownCount = -1;
+    raf = requestAnimationFrame(step);
+  }
+
+  resize();
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduce) { T = DUR; drawScene(T); sample(); render(); setStatus(true); }
+  else start();
+
+  document.getElementById('replay').addEventListener('click', function () {
+    if (reduce) { T = DUR; drawScene(T); sample(); render(); setStatus(true); }
+    else start();
+  });
+  var rt = 0;
+  window.addEventListener('resize', function () {
+    clearTimeout(rt);
+    rt = setTimeout(function () { resize(); render(); }, 120);
+  });
+})();
+</script>
+
+</body>
+</html>
